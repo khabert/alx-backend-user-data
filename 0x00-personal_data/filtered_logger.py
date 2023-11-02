@@ -1,67 +1,78 @@
 #!/usr/bin/env python3
-"""Handling personal data with the logging module"""
-
-from typing import List
-import csv
+"""A module for filtering logs.
+"""
+import os
+import re
 import logging
 import mysql.connector
-import re
-import os
-
-# PII_FIELDS = ('name', 'email', 'phone', 'ssn', 'password')
+from typing import List
 
 
-def get_db() -> mysql.connector.connection.MySQLConnection:
-    """Returns a connector to the database"""
-    db_name = os.getenv("PERSONAL_DATA_DB_NAME")
-    db_username = os.getenv("PERSONAL_DATA_DB_USERNAME")
-    db_password = os.getenv("PERSONAL_DATA_DB_PASSWORD")
-    db_host = os.getenv("PERSONAL_DATA_DB_HOST")
-    db = mysql.connector.connect(
-        database=db_name if db_name else 'my_db',
-        host=db_host if db_host else 'localhost',
-        user=db_username if db_username else 'root',
-        password=db_password if db_password else 'root'
-    )
-
-    return db
+patterns = {
+    'extract': lambda x, y: r'(?P<field>{})=[^{}]*'.format('|'.join(x), y),
+    'replace': lambda x: r'\g<field>={}'.format(x),
+}
+PII_FIELDS = ("name", "email", "phone", "ssn", "password")
 
 
-with open('user_data.csv', 'r') as f:
-    PII_FIELDS: tuple = ()
-    reader = csv.reader(f)
-    fields = next(reader)
-    PII = ['name', 'address', 'email', 'ssn', 'passport', 'dl',
-           'cc', 'birth', 'dob', 'born', 'phone', 'telephone',
-           'vin', 'username', 'password', 'mac', 'ip']
-    for field in fields:
-        if field in PII:
-            if len(PII_FIELDS) < 5:
-                PII_FIELDS += (field,)
-            else:
-                break
+def filter_datum(
+        fields: List[str], redaction: str, message: str, separator: str,
+        ) -> str:
+    """Filters a log line.
+    """
+    extract, replace = (patterns["extract"], patterns["replace"])
+    return re.sub(extract(fields, separator), replace(redaction), message)
 
 
 def get_logger() -> logging.Logger:
-    """returns a logger for logging user data"""
-    user_logger = logging.Logger("user_data")
-    user_logger.setLevel(logging.INFO)
-    user_logger.propagate = False
+    """Creates a new logger for user data.
+    """
+    logger = logging.getLogger("user_data")
+    stream_handler = logging.StreamHandler()
+    stream_handler.setFormatter(RedactingFormatter(PII_FIELDS))
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    logger.addHandler(stream_handler)
+    return logger
 
-    handler = logging.StreamHandler()
-    handler.setFormatter(RedactingFormatter(PII_FIELDS))
-    user_logger.addHandler(handler)
-    return user_logger
+
+def get_db() -> mysql.connector.connection.MySQLConnection:
+    """Creates a connector to a database.
+    """
+    db_host = os.getenv("PERSONAL_DATA_DB_HOST", "localhost")
+    db_name = os.getenv("PERSONAL_DATA_DB_NAME", "")
+    db_user = os.getenv("PERSONAL_DATA_DB_USERNAME", "root")
+    db_pwd = os.getenv("PERSONAL_DATA_DB_PASSWORD", "")
+    connection = mysql.connector.connect(
+        host=db_host,
+        port=3306,
+        user=db_user,
+        password=db_pwd,
+        database=db_name,
+    )
+    return connection
 
 
-def filter_datum(fields: List[str], redaction: str,
-                 message: str, separator: str) -> str:
-    """ returns the log message obfuscated """
-    temp = message
-    for field in fields:
-        temp = re.sub(field + "=.*?" + separator,
-                      field + "=" + redaction + separator, temp)
-    return temp
+def main():
+    """Logs the information about user records in a table.
+    """
+    fields = "name,email,phone,ssn,password,ip,last_login,user_agent"
+    columns = fields.split(',')
+    query = "SELECT {} FROM users;".format(fields)
+    info_logger = get_logger()
+    connection = get_db()
+    with connection.cursor() as cursor:
+        cursor.execute(query)
+        rows = cursor.fetchall()
+        for row in rows:
+            record = map(
+                lambda x: '{}={}'.format(x[0], x[1]),
+                zip(columns, row),
+            )
+            msg = '{};'.format('; '.join(list(record)))
+            args = ("user_data", logging.INFO, None, None, msg, None, None)
+            log_record = logging.LogRecord(*args)
+            info_logger.handle(log_record)
 
 
 class RedactingFormatter(logging.Formatter):
@@ -70,46 +81,19 @@ class RedactingFormatter(logging.Formatter):
 
     REDACTION = "***"
     FORMAT = "[HOLBERTON] %(name)s %(levelname)s %(asctime)-15s: %(message)s"
+    FORMAT_FIELDS = ('name', 'levelname', 'asctime', 'message')
     SEPARATOR = ";"
 
     def __init__(self, fields: List[str]):
-        """inherits init from Formatter"""
         super(RedactingFormatter, self).__init__(self.FORMAT)
         self.fields = fields
 
     def format(self, record: logging.LogRecord) -> str:
+        """formats a LogRecord.
         """
-        uses the format() method from parent and
-        applies and extra filter with filter_datum()
-        """
-        log: logging.Formatter = super().format(record)
-        return filter_datum(self.fields, self.REDACTION, log, self.SEPARATOR)
-
-
-def main():
-    """
-    Use all the above functions
-    to read from a database and log the
-    rows from the 'users' table, filtering
-    personal data.
-    """
-    db = get_db()
-    cursor = db.cursor()
-
-    cursor.execute('SELECT * FROM users;')
-    rows = cursor.fetchall()
-
-    logger = get_logger()
-    field_names = [i[0] for i in cursor.description]
-
-    for row in rows:
-        message = ''
-        for field in range(len(row)):
-            message += f'{field_names[field]}={row[field]};'
-        logger.info(message)
-
-    cursor.close()
-    db.close()
+        msg = super(RedactingFormatter, self).format(record)
+        txt = filter_datum(self.fields, self.REDACTION, msg, self.SEPARATOR)
+        return txt
 
 
 if __name__ == "__main__":
