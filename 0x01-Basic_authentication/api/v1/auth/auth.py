@@ -51,4 +51,3 @@ class Auth:
             _type_: _description_
         """
         return None
-
